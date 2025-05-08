@@ -6,5 +6,21 @@
       "path": "/graphql",
       "auth": "bearer-token"
     }
+  },
+  "models": {
+    "google-gemini": {
+      "sourceModel": "gemini-2.5-flash-preview-04-17",
+      "connection": "model-router",
+      "path": "v1/chat/completions"
+    }
+  },
+  "connections": {
+    "model-router": {
+      "type": "http",
+      "baseUrl": "https://models.hypermode.host/",
+      "headers": {
+        "Authorization": "Bearer {{HYP_WKS_KEY}}"
+      }
+    }
   }
 }
