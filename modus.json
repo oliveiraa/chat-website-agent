@@ -21,6 +21,10 @@
       "headers": {
         "Authorization": "Bearer {{HYP_WKS_KEY}}"
       }
+    },
+    "website": {
+      "type": "dgraph",
+      "connString": "dgraph://website-mensch-work.hypermode.host:443?sslmode=verify-ca&bearertoken={{HYP_DGRAPH_KEY}}"
     }
   }
 }
