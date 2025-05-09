@@ -45,6 +45,8 @@ func Chat(sessionID string, userMessage string) (*ChatResponse, error) {
 		return nil, fmt.Errorf("error getting model: %w", err)
 	}
 
+	turnTimestamp := time.Now().UTC() // Capture timestamp for the current turn
+
 	ctx := context.Background() // Context for Dgraph operations
 
 	// 1. Load history from Dgraph
@@ -71,7 +73,7 @@ func Chat(sessionID string, userMessage string) (*ChatResponse, error) {
 	userMessageToSave := DgraphChatMessage{
 		Role:       "user",
 		Content:    userMessage,
-		Timestamp:  time.Now().UTC(), // Crucial for ordering and saving
+		Timestamp:  turnTimestamp, // Use captured turn timestamp
 		DgraphType: []string{"ChatMessage"},
 	}
 	currentChatHistoryForLLM = append(currentChatHistoryForLLM, userMessageToSave)
@@ -110,7 +112,7 @@ func Chat(sessionID string, userMessage string) (*ChatResponse, error) {
 	assistantMessageToSave := DgraphChatMessage{
 		Role:       "assistant",
 		Content:    assistantContent,
-		Timestamp:  time.Now().UTC().Add(time.Millisecond), // Ensure assistant timestamp is slightly after user
+		Timestamp:  turnTimestamp, // Use captured turn timestamp
 		DgraphType: []string{"ChatMessage"},
 	}
 
@@ -128,17 +130,11 @@ func Chat(sessionID string, userMessage string) (*ChatResponse, error) {
 }
 
 func loadHistoryFromDgraph(ctx context.Context, sessionID string) ([]DgraphChatMessage, error) {
-	// Query to get ChatSession UID and then its messages ordered by timestamp
-	// New strategy:
 	// 1. Find the UID of the ChatSession with the given sessionID.
-	// 2. Find ChatMessage nodes linked to this ChatSession UID via 'in_session', ordered by timestamp.
+	// 2. Find ChatMessage nodes linked to this ChatSession via the new ChatMessage.sessionIDRef predicate, ordered by timestamp.
 	query := `
         query getSessionMessages($sessionID: string) {
-            var(func: eq(ChatSession.sessionID, $sessionID)) {
-                TARGET_SESSION_UID as uid
-            }
-
-            messages(func: type(ChatMessage), orderasc: ChatMessage.timestamp) @filter(uid_in(in_session, uid(TARGET_SESSION_UID))) {
+            messages(func: eq(ChatMessage.sessionIDRef, $sessionID), orderasc: ChatMessage.timestamp) @filter(type(ChatMessage)) {
                 uid
                 role: ChatMessage.role
                 content: ChatMessage.content
@@ -183,12 +179,6 @@ func loadHistoryFromDgraph(ctx context.Context, sessionID string) ([]DgraphChatM
 				// DgraphType is not strictly needed for loaded messages unless we re-mutate them
 			})
 		}
-	} else {
-		// This case implies the "messages" key was missing or null in JSON, which is unlikely if the query executes.
-		// An empty result from Dgraph for the "messages" block would be `{"messages":[]}`,
-		// for which queryResult.Messages would be an empty non-nil slice.
-		// Logging here for completeness, though the above loop handles empty results gracefully.
-		fmt.Printf("DEBUG: Dgraph query for session %s resulted in nil Messages array (or key missing). JSON: %s\\n", sessionID, string(resp.Json))
 	}
 
 	// Dgraph's `orderasc` should handle the ordering.
@@ -214,24 +204,15 @@ func saveNewMessagesToDgraph(ctx context.Context, sessionID string, newMessages 
 	for i, msg := range newMessages {
 		messageBlankNode := fmt.Sprintf("_:msg%d", i)
 		chatMessageObject := map[string]interface{}{
-			"uid":                   messageBlankNode,
-			"dgraph.type":           "ChatMessage",
-			"ChatMessage.role":      msg.Role,
-			"ChatMessage.content":   msg.Content,
-			"ChatMessage.timestamp": msg.Timestamp.Format(time.RFC3339Nano),
-			"in_session": map[string]interface{}{
-				"uid": sessionBlankNode,
-			},
+			"uid":                      messageBlankNode,
+			"dgraph.type":              "ChatMessage",
+			"ChatMessage.role":         msg.Role,
+			"ChatMessage.content":      msg.Content,
+			"ChatMessage.timestamp":    msg.Timestamp.Format(time.RFC3339Nano),
+			"ChatMessage.sessionIDRef": sessionID, // Link message to session by sessionID
 		}
 		dgraphMutations = append(dgraphMutations, chatMessageObject)
-
-		sessionLinkToMessage := map[string]interface{}{
-			"uid": sessionBlankNode,
-			"ChatSession.has_message": map[string]interface{}{
-				"uid": messageBlankNode,
-			},
-		}
-		dgraphMutations = append(dgraphMutations, sessionLinkToMessage)
+		// The explicit sessionLinkToMessage mutation is no longer needed
 	}
 
 	setJsonPayload, err := json.Marshal(dgraphMutations)
@@ -255,104 +236,88 @@ func saveNewMessagesToDgraph(ctx context.Context, sessionID string, newMessages 
 
 // ClearChat clears the chat history for a specific session from Dgraph
 func ClearChat(sessionID string) (*ClearChatResponse, error) {
-	// deleteMutationDQL is removed as dgraph.Mutation does not seem to support a Query field for DQL execution.
-	// TODO: ClearChat needs a different approach for deletion.
-	// This would typically involve querying UIDs of the session and messages,
-	// then using DelJson or DelNquads fields in dgraph.Mutation if they exist.
-	// For now, this function will be a no-op regarding Dgraph deletion to clear linter errors.
+	// 1. Query for UIDs of the session and its messages
+	query := `
+        query getUidsForDeletion($sessionID: string) {
+            session(func: eq(ChatSession.sessionID, $sessionID)) @filter(type(ChatSession)) {
+                uid
+            }
+            messages(func: eq(ChatMessage.sessionIDRef, $sessionID)) @filter(type(ChatMessage)) {
+                uid
+            }
+        }
+    `
+	vars := map[string]string{"$sessionID": sessionID}
 
-	mutation := &dgraph.Mutation{
-		// Empty mutation for now
-	}
-
-	// Adjusted ExecuteMutations call
-	_, err := dgraph.ExecuteMutations(dgraphConnectionName, mutation)
+	queryResponse, err := dgraph.ExecuteQuery(dgraphConnectionName, &dgraph.Query{
+		Query:     query,
+		Variables: vars,
+	})
 	if err != nil {
-		fmt.Printf("Error during Dgraph ClearChat (currently a no-op) for session %s: %v\\n", sessionID, err)
 		return &ClearChatResponse{
 			Success: false,
-			Message: fmt.Sprintf("Failed to clear chat history from Dgraph: %v", err),
+			Message: fmt.Sprintf("Failed to query Dgraph for UIDs to delete session %s: %v", sessionID, err),
+		}, nil
+	}
+
+	var queryResult struct {
+		Session []struct {
+			UID string `json:"uid"`
+		} `json:"session"`
+		Messages []struct {
+			UID string `json:"uid"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(queryResponse.Json), &queryResult); err != nil {
+		return &ClearChatResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to unmarshal Dgraph response for session %s UIDs: %v. JSON: %s", sessionID, err, string(queryResponse.Json)),
+		}, nil
+	}
+
+	// 2. Collect UIDs for deletion
+	var uidsToDelete []string // Store UIDs directly as strings
+	if len(queryResult.Session) > 0 && queryResult.Session[0].UID != "" {
+		uidsToDelete = append(uidsToDelete, queryResult.Session[0].UID)
+	}
+	for _, msg := range queryResult.Messages {
+		if msg.UID != "" {
+			uidsToDelete = append(uidsToDelete, msg.UID)
+		}
+	}
+
+	if len(uidsToDelete) == 0 {
+		return &ClearChatResponse{
+			Success: true,
+			Message: fmt.Sprintf("No chat history found for session %s, or it was already clear.", sessionID),
+		}, nil
+	}
+
+	// 3. Format UIDs into N-Quad delete statements
+	var nquadsBuilder strings.Builder
+	for _, uid := range uidsToDelete {
+		nquadsBuilder.WriteString(fmt.Sprintf("<%s> * * .\n", uid))
+	}
+	deleteNquadsPayload := nquadsBuilder.String()
+
+	// 4. Create and execute mutation for deletion using DelNquads
+	// This assumes the dgraph.Mutation struct supports a `DelNquads` field.
+	mutation := &dgraph.Mutation{
+		DelNquads: deleteNquadsPayload, // Using DelNquads
+	}
+
+	_, err = dgraph.ExecuteMutations(dgraphConnectionName, mutation)
+	if err != nil {
+		return &ClearChatResponse{
+			Success: false,
+			Message: fmt.Sprintf("Dgraph ExecuteMutations failed to delete data for session %s using N-Quads: %v. Payload:\n%s", sessionID, err, deleteNquadsPayload),
 		}, nil
 	}
 
 	return &ClearChatResponse{
 		Success: true,
-		Message: "Chat history cleared successfully from Dgraph.",
+		Message: fmt.Sprintf("Chat history for session %s (including %d messages and the session node) cleared successfully from Dgraph.", sessionID, len(queryResult.Messages)),
 	}, nil
-}
-
-// TestDgraphInteraction is a simple function to test Dgraph connectivity and basic operations.
-func TestDgraphInteraction() (string, error) {
-	// ctx := context.Background() // Removed as it was unused
-	testSessionID := "test-session-dgraph-debug"
-	testNodeUID := "_:testnode"
-
-	// 1. Define a test mutation to create a simple node
-	testMutationData := map[string]interface{}{
-		"uid":                  testNodeUID,
-		"dgraph.type":          "TestNode",
-		"TestNode.name":        "Dgraph Test Entry",
-		"TestNode.timestamp":   time.Now().UTC().Format(time.RFC3339Nano),
-		"TestNode.sessionLink": testSessionID, // Just an example field
-	}
-
-	setJsonPayload, err := json.Marshal([]interface{}{testMutationData})
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal test mutation JSON: %w", err)
-	}
-
-	mutation := &dgraph.Mutation{
-		SetJson: string(setJsonPayload),
-	}
-
-	fmt.Printf("Attempting to execute test mutation: %s\n", string(setJsonPayload))
-	muResponse, err := dgraph.ExecuteMutations(dgraphConnectionName, mutation)
-	if err != nil {
-		return "", fmt.Errorf("dgraph.ExecuteMutations failed for test: %w. Payload: %s", err, string(setJsonPayload))
-	}
-	fmt.Printf("Test mutation response: %+v\n", muResponse) // Log the response details
-
-	// Extract assigned UID if mutation was successful and a new node was created
-	// This depends on how Dgraph client/SDK returns UIDs for blank nodes.
-	// For simplicity, we'll query by a known field.
-
-	// 2. Define a query to retrieve the test node
-	query := `
-		query getTestNode($testID: string) {
-			testNodes(func: eq(TestNode.sessionLink, $testID)) {
-				uid
-				name: TestNode.name
-				timestamp: TestNode.timestamp
-				session: TestNode.sessionLink
-			}
-		}
-	`
-	vars := map[string]string{"$testID": testSessionID}
-
-	fmt.Printf("Attempting to execute test query for sessionLink: %s\n", testSessionID)
-	queryResp, err := dgraph.ExecuteQuery(dgraphConnectionName, &dgraph.Query{
-		Query:     query,
-		Variables: vars,
-	})
-	if err != nil {
-		return "", fmt.Errorf("dgraph.ExecuteQuery failed for test: %w", err)
-	}
-
-	fmt.Printf("Test query JSON response: %s\n", queryResp.Json)
-
-	// Minimal parsing to confirm we got something
-	var queryResult struct {
-		TestNodes []map[string]interface{} `json:"testNodes"`
-	}
-	if err := json.Unmarshal([]byte(queryResp.Json), &queryResult); err != nil {
-		return "", fmt.Errorf("failed to unmarshal Dgraph test query response: %w. JSON: %s", err, string(queryResp.Json))
-	}
-
-	if len(queryResult.TestNodes) == 0 {
-		return "", fmt.Errorf("no test nodes found for sessionLink %s. Mutation might have failed silently or query is incorrect", testSessionID)
-	}
-
-	return fmt.Sprintf("Dgraph test successful! Found test node: %+v", queryResult.TestNodes[0]), nil
 }
 
 // SayHello is kept from the original code
@@ -371,56 +336,13 @@ func SayHello(name *string) string {
 // This function should be called to ensure Dgraph is properly configured.
 func ApplyDgraphSchema() (string, error) {
 	schema := `
-		# type ChatSession {
-		# 	ChatSession.sessionID: string @index(exact) .
-		# 	ChatSession.has_message: [uid] @reverse .
-		# }
-		# 
-		# type ChatMessage {
-		# 	ChatMessage.role: string .
-		# 	ChatMessage.content: string .
-		# 	ChatMessage.timestamp: datetime @index(hour) .
-		# 	in_session: uid @reverse .
-		# }
-		# 
-		# # Schema for TestDgraphInteraction function
-		# type TestNode {
-		# 	TestNode.name: string .
-		# 	TestNode.timestamp: datetime .
-		# 	TestNode.sessionLink: string @index(exact) .
-		# }
-
 		ChatSession.sessionID: string @index(exact) .
-		ChatSession.has_message: [uid] @reverse .
 		ChatMessage.role: string .
 		ChatMessage.content: string .
-		ChatMessage.timestamp: datetime @index(hour) .
-		in_session: uid @reverse .
-
-		TestNode.name: string .
-		TestNode.timestamp: datetime .
-		TestNode.sessionLink: string @index(exact) .
+		ChatMessage.timestamp: datetime @index(day) @index(hour) .
+		ChatMessage.sessionIDRef: string @index(exact) .
 	`
 	// The connection name must match the one in modus.json and used in other Dgraph calls
-	// Assuming AlterSchema returns a response string and an error, or just an error.
-	// Based on the linter, it seems to return a single value (string) or (string, error) or (error).
-	// Let's try with the (string, error) pattern first, as it's common.
-	// If the linter complained about 2 values for 1, it might return just error or just string.
-	// The docs (https://docs.hypermode.com/modus/sdk/dgraph) show: function alterSchema(connectionName: string, schema: string): string;
-	// This suggests it returns a single string (response/status) and error is handled internally or via panic for Go SDKs, or it's a non-Go signature.
-	// For Go, `func AlterSchema(connectionName string, schema string) error` is more idiomatic if it only signals success/failure.
-	// Given the previous linter error (2 variables for 1 value), it means it returns ONLY ONE value.
-	// Let's assume it's an error, which is a common Go pattern for such functions.
-	// If it were a string response, we'd need to clarify how errors are propagated.
-
-	// Attempting to match the Go SDK's dgraph.AlterSchema function signature.
-	// The SDK documentation (https://docs.hypermode.com/modus/sdk/go/dgraph) does not explicitly show AlterSchema's signature.
-	// However, other execute functions return (Response, error). Let's try to find its actual signature.
-	// The linter error "assignment mismatch: 2 variables but dgraph.AlterSchema returns 1 value" is key.
-	// This implies `func AlterSchema(connectionName string, schema string) SOMETHING` where SOMETHING is a single type.
-	// Typically, this would be `error` if the primary purpose is to report success/failure.
-
-	// Let's assume the SDK function is: `func AlterSchema(connectionName string, schema string) error`
 	err := dgraph.AlterSchema(dgraphConnectionName, schema)
 	if err != nil {
 		return "", fmt.Errorf("failed to alter Dgraph schema: %w", err)
