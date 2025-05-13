@@ -1,4 +1,4 @@
-module gaia-website-agent
+module chat-website-agent
 
 go 1.24.2
 
